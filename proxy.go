@@ -143,6 +143,30 @@ func (proxy *httpProxy) Addr() string {
 	return proxy.addr
 }
 
+var deniedLocalAddresses []string
+
+func getLocalAddresses() {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return
+	}
+	for _, i := range ifaces {
+		addrs, er := i.Addrs()
+		if er != nil {
+			return
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			deniedLocalAddresses = append(deniedLocalAddresses, ip.String())
+		}
+	}
+}
 func (hp *httpProxy) Serve(wg *sync.WaitGroup, quit <-chan struct{}) {
 	defer func() {
 		wg.Done()
@@ -160,15 +184,17 @@ func (hp *httpProxy) Serve(wg *sync.WaitGroup, quit <-chan struct{}) {
 	}()
 	host, _, _ := net.SplitHostPort(hp.addr)
 	var pacURL string
-	if host == "" || host == "0.0.0.0" {
-		pacURL = fmt.Sprintf("http://<hostip>:%s/pac", hp.port)
-	} else if hp.addrInPAC == "" {
-		pacURL = fmt.Sprintf("http://%s/pac", hp.addr)
-	} else {
+	if hp.addrInPAC != "" {
 		pacURL = fmt.Sprintf("http://%s/pac", hp.addrInPAC)
+	} else {
+		if host == "" || host == "0.0.0.0" {
+			pacURL = fmt.Sprintf("http://<hostip>:%s/pac", hp.port)
+		} else {
+			pacURL = fmt.Sprintf("http://%s/pac", hp.addr)
+		}
 	}
+	getLocalAddresses()
 	info.Printf("COW %s listen http %s, PAC url %s\n", version, hp.addr, pacURL)
-
 	for {
 		conn, err := ln.Accept()
 		if err != nil && !exit {
@@ -343,7 +369,7 @@ func isSelfRequest(r *Request) bool {
 	// But if client PAC setting is using cow server's DNS name, we can't
 	// decide if the request is for cow itself (need reverse lookup).
 	// So if request path seems like getting PAC, simply return true.
-	if r.URL.Path == "/pac" || strings.HasPrefix(r.URL.Path, "/pac?") {
+	if r.URL.Path == "/pac" || r.URL.Path == "/proxy.pac" || strings.HasPrefix(r.URL.Path, "/pac?") {
 		return true
 	}
 	r.URL.ParseHostPort(r.Header.Host)
@@ -361,7 +387,7 @@ func (c *clientConn) serveSelfURL(r *Request) (err error) {
 	if r.Method != "GET" {
 		goto end
 	}
-	if r.URL.Path == "/pac" || strings.HasPrefix(r.URL.Path, "/pac?") {
+	if r.URL.Path == "/pac" || r.URL.Path == "/proxy.pac" || strings.HasPrefix(r.URL.Path, "/pac?") {
 		sendPAC(c)
 		// PAC header contains connection close, send non nil error to close
 		// client connection.
@@ -739,6 +765,18 @@ func (c *clientConn) getServerConn(r *Request) (*serverConn, error) {
 }
 
 func connectDirect2(url *URL, siteInfo *VisitCnt, recursive bool) (net.Conn, error) {
+	addrs, er := net.LookupHost(url.Host)
+	if er == nil {
+		for _, addr := range addrs {
+			for _, denied := range deniedLocalAddresses {
+				if addr == denied {
+					return nil, errors.New(
+						"Connecting to local is prohibited.")
+				}
+			}
+		}
+	}
+
 	var c net.Conn
 	var err error
 	if siteInfo.AlwaysDirect() {
