@@ -97,6 +97,7 @@ type clientConn struct {
 	bufRd    *bufio.Reader
 	buf      []byte // buffer for the buffered reader
 	proxy    Proxy
+	start    time.Time // 记录连接开始的时间
 }
 
 var (
@@ -1027,25 +1028,17 @@ const connectBufSize = 4096
 // concurrent connect method.
 var connectBuf = leakybuf.NewLeakyBuf(512, connectBufSize)
 
-func copyServer2Client(sv *serverConn, c *clientConn, r *Request) (err error) {
+func copyServer2Client(sv *serverConn, c *clientConn, r *Request, srvStopped *notification) (err error) {
 	buf := connectBuf.Get()
 	defer func() {
 		connectBuf.Put(buf)
 	}()
 
-	/*
-		// force retry for debugging
-		if r.tryCnt == 1 && sv.maybeFake() {
-			time.Sleep(1)
-			return RetryError{errors.New("debug retry in copyServer2Client")}
-		}
-	*/
-
 	total := 0
 	const directThreshold = 8192
 	readTimeoutSet := false
+
 	for {
-		// debug.Println("srv->cli")
 		if sv.maybeFake() {
 			sv.setReadTimeout("srv->cli")
 			readTimeoutSet = true
@@ -1053,25 +1046,25 @@ func copyServer2Client(sv *serverConn, c *clientConn, r *Request) (err error) {
 			sv.unsetReadTimeout("srv->cli")
 			readTimeoutSet = false
 		}
-		var n int
-		if n, err = sv.Read(buf); err != nil {
+
+		n, err := sv.Read(buf)
+		if err != nil {
 			if sv.maybeFake() && maybeBlocked(err) {
 				siteStat.TempBlocked(r.URL)
-				debug.Printf("srv->cli blocked site %s detected, err: %v retry\n", r.URL.HostPort, err)
+				errl.Printf("srv->cli blocked site %s detected, err: %v retry\n", r.URL.HostPort, err)
 				return RetryError{err}
+			} else if isErrTimeout(err) && !srvStopped.hasNotified() {
+				continue
 			}
-			// Expected error besides EOF: "use of closed network connection",
-			// this is to make blocking read return.
-			// debug.Printf("copyServer2Client read data: %v\n", err)
-			return
+			return err
 		}
+
 		total += n
-		if _, err = c.Write(buf[0:n]); err != nil {
-			// debug.Printf("copyServer2Client write data: %v\n", err)
-			return
+		if _, err = c.Write(buf[:n]); err != nil {
+			errl.Printf("Error writing to client: %v", err)
+			return err
 		}
-		// debug.Printf("srv(%s)->cli(%s) sent %d bytes data\n", r.URL.HostPort, c.RemoteAddr(), total)
-		// set state to rsRecvBody to indicate the request has partial response sent to client
+
 		r.state = rsRecvBody
 		sv.state = svSendRecvResponse
 		if total > directThreshold {
@@ -1110,94 +1103,35 @@ func (sw *serverWriter) Write(p []byte) (int, error) {
 	return sw.sv.Write(p)
 }
 
-func copyClient2Server(c *clientConn, sv *serverConn, r *Request, srvStopped notification, done chan struct{}) (err error) {
-	// sv.maybeFake may change during execution in this function.
-	// So need a variable to record the whether timeout is set.
-	deadlineIsSet := false
-	defer func() {
-		if deadlineIsSet {
-			// May need to retry, unset timeout here to avoid read client
-			// timeout on retry. Note c.Conn maybe closed when calling this.
-			unsetConnReadTimeout(c.Conn, "cli->srv after err")
-		}
-		close(done)
-	}()
-
-	var n int
-
-	if r.isRetry() {
-		if debug {
-			debug.Printf("cli(%s)->srv(%s) retry request %d bytes of buffered body\n",
-				c.RemoteAddr(), r.URL.HostPort, len(r.rawBody()))
-		}
-		if _, err = sv.Write(r.rawBody()); err != nil {
-			debug.Println("cli->srv send to server error")
-			return
-		}
-	}
-
-	w := newServerWriter(r, sv)
-	if c.bufRd != nil {
-		n = c.bufRd.Buffered()
-		if n > 0 {
-			buffered, _ := c.bufRd.Peek(n) // should not return error
-			if _, err = w.Write(buffered); err != nil {
-				// debug.Printf("cli->srv write buffered err: %v\n", err)
-				return
-			}
-		}
-		if debug {
-			debug.Printf("cli(%s)->srv(%s) released read buffer\n",
-				c.RemoteAddr(), r.URL.HostPort)
-		}
-		c.releaseBuf()
-	}
-
-	var start time.Time
-	if config.DetectSSLErr {
-		start = time.Now()
-	}
+func copyClient2Server(c *clientConn, sv *serverConn, r *Request, srvStopped *notification, done chan struct{}) (err error) {
 	buf := connectBuf.Get()
 	defer func() {
 		connectBuf.Put(buf)
 	}()
+	var deadlineIsSet bool
+
 	for {
-		// debug.Println("cli->srv")
 		if sv.maybeFake() {
 			setConnReadTimeout(c.Conn, time.Second, "cli->srv")
 			deadlineIsSet = true
 		} else if deadlineIsSet {
-			// maybeFake may trun to false after timeout, but timeout should be unset
 			unsetConnReadTimeout(c.Conn, "cli->srv before read")
 			deadlineIsSet = false
 		}
-		if n, err = c.Read(buf); err != nil {
+
+		n, err := c.Read(buf)
+		if err != nil {
 			if config.DetectSSLErr && sv.maybeFake() && (isErrConnReset(err) || err == io.EOF) &&
-				sv.maybeSSLErr(start) {
+				sv.maybeSSLErr(c.start) {
 				debug.Println("client connection closed very soon, taken as SSL error:", r)
 				siteStat.TempBlocked(r.URL)
 			} else if isErrTimeout(err) && !srvStopped.hasNotified() {
-				// debug.Printf("cli(%s)->srv(%s) timeout\n", c.RemoteAddr(), r.URL.HostPort)
 				continue
 			}
-			// debug.Printf("cli->srv read err: %v\n", err)
-			return
+			return err
 		}
 
-		// copyServer2Client will detect write to closed server. Just store client content for retry.
-		if _, err = w.Write(buf[:n]); err != nil {
-			// XXX is it enough to only do block detection in copyServer2Client?
-			/*
-				if sv.maybeFake() && isErrConnReset(err) {
-					siteStat.TempBlocked(r.URL)
-					errl.Printf("copyClient2Server blocked site %d detected, retry\n", r.URL.HostPort)
-					return RetryError{err}
-				}
-			*/
-			// debug.Printf("cli->srv write err: %v\n", err)
-			return
-		}
-		// debug.Printf("cli(%s)->srv(%s) sent %d bytes data\n", c.RemoteAddr(), r.URL.HostPort, n)
+		_, err = sv.Write(buf[:n])
 	}
 }
 
@@ -1219,7 +1153,6 @@ func (sv *serverConn) doConnect(r *Request, c *clientConn) (err error) {
 			return err
 		}
 	} else if !r.isRetry() {
-		// debug.Printf("send connection confirmation to %s->%s\n", c.RemoteAddr(), r.URL.HostPort)
 		if _, err = c.Write(connEstablished); err != nil {
 			debug.Printf("cli(%s) error send 200 Connecion established: %v\n",
 				c.RemoteAddr(), err)
@@ -1231,29 +1164,25 @@ func (sv *serverConn) doConnect(r *Request, c *clientConn) (err error) {
 	done := make(chan struct{})
 	srvStopped := newNotification()
 	go func() {
-		// debug.Printf("doConnect: cli(%s)->srv(%s)\n", c.RemoteAddr(), r.URL.HostPort)
-		cli2srvErr = copyClient2Server(c, sv, r, srvStopped, done)
-		// Close sv to force read from server in copyServer2Client return.
-		// Note: there's no other code closing the server connection for CONNECT.
+		cli2srvErr = copyClient2Server(c, sv, r, &srvStopped, done) // 传递 srvStopped 的地址
 		sv.Close()
+		close(done)
 	}()
 
-	// debug.Printf("doConnect: srv(%s)->cli(%s)\n", r.URL.HostPort, c.RemoteAddr())
-	err = copyServer2Client(sv, c, r)
+	err = copyServer2Client(sv, c, r, &srvStopped)
+
 	if isErrRetry(err) {
 		srvStopped.notify()
 		<-done
-		// debug.Printf("doConnect: cli(%s)->srv(%s) stopped\n", c.RemoteAddr(), r.URL.HostPort)
 	} else {
-		// close client connection to force read from client in copyClient2Server return
 		c.Conn.Close()
 	}
+
 	if isErrRetry(cli2srvErr) {
 		return cli2srvErr
 	}
-	return
+	return err
 }
-
 func (sv *serverConn) sendHTTPProxyRequestHeader(r *Request, c *clientConn) (err error) {
 	if _, err = sv.Write(r.proxyRequestLine()); err != nil {
 		return c.handleServerWriteError(r, sv, err,
@@ -1485,4 +1414,63 @@ func sendBody(w io.Writer, bufRd *bufio.Reader, contLen int, chunk bool) (err er
 		err = sendBodySplitIntoChunk(w, bufRd)
 	}
 	return
+}
+
+// 新增https代理处理
+type httpsProxy struct {
+	addr      string // listen address, contains port
+	port      string // for use when generating PAC
+	addrInPAC string // proxy server address to use in PAC
+}
+
+func newHttpsProxy(addr, addrInPAC string) *httpsProxy {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		panic("proxy addr" + err.Error())
+	}
+	return &httpsProxy{addr, port, addrInPAC}
+}
+func (proxy *httpsProxy) genConfig() string {
+	if proxy.addrInPAC != "" {
+		return fmt.Sprintf("listen = https://%s %s", proxy.addr, proxy.addrInPAC)
+	} else {
+		return fmt.Sprintf("listen = https://%s", proxy.addr)
+	}
+}
+func (proxy *httpsProxy) Addr() string {
+	return proxy.addr
+}
+func (proxy *httpsProxy) Serve(wg *sync.WaitGroup, quit <-chan struct{}) {
+	defer func() {
+		wg.Done()
+	}()
+	ln, err := net.Listen("tcp", proxy.addr)
+	if err != nil {
+		fmt.Println("listen https failed:", err)
+		return
+	}
+	info.Printf("COW %s listen https %s\n", version, proxy.addr)
+	var exit bool
+	go func() {
+		<-quit
+		exit = true
+		ln.Close()
+	}()
+	for {
+		conn, err := ln.Accept()
+		if err != nil && !exit {
+			errl.Printf("https proxy(%s) accept %v\n", ln.Addr(), err)
+			if isErrTooManyOpenFd(err) {
+				connPool.CloseAll()
+			}
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		if exit {
+			debug.Println("exiting https listner")
+			break
+		}
+		c := newClientConn(conn, proxy)
+		go c.serve()
+	}
 }

@@ -85,7 +85,7 @@ onErr:
 func runEstimateTimeout() {
 	const estimateReq = "GET / HTTP/1.1\r\n" +
 		"Host: %s\r\n" +
-		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.8; rv:11.0) Gecko/20100101 Firefox/11.0\r\n" +
+		"User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.8; rv:11.0) Gecko/20100101 Firefox/11.0\r\n" +
 		"Accept: */*\r\n" +
 		"Accept-Language: en-us,en;q=0.5\r\n" +
 		"Accept-Encoding: gzip, deflate\r\n" +

@@ -295,6 +295,24 @@ func (lp listenParser) ListenHttp(val string) {
 	}
 	addListenProxy(newHttpProxy(addr, addrInPAC))
 }
+func (lp listenParser) ListenHttps(val string) {
+	if cmdHasListenAddr {
+		return
+	}
+	arr := strings.Fields(val)
+	if len(arr) > 2 {
+		Fatal("too many fields in listen =", val)
+	}
+	var addr, addrInPAC string
+	addr = arr[0]
+	if len(arr) == 2 {
+		addrInPAC = arr[1]
+	}
+	if err := checkServerAddr(addr); err != nil {
+		Fatal("listen https server", err)
+	}
+	addListenProxy(newHttpsProxy(addr, addrInPAC))
+}
 
 func (lp listenParser) ListenCow(val string) {
 	if cmdHasListenAddr {

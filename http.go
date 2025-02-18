@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/cyfdecyf/bufio"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -618,6 +619,10 @@ func parseRequest(c *clientConn, r *Request) (err error) {
 		if bool(dbgRq) && verbose && !config.saveReqLine {
 			r.raw.Write(s)
 		}
+		if r.isConnect {
+			c.handleConnect(r)
+			return nil
+		}
 	} else {
 		r.genRequestLine()
 	}
@@ -642,6 +647,36 @@ func parseRequest(c *clientConn, r *Request) (err error) {
 	r.raw.WriteString(CRLF)
 	r.bodyStart = r.raw.Len()
 	return
+}
+
+func (c *clientConn) handleConnect(r *Request) {
+	if config.DetectSSLErr {
+		c.start = time.Now()
+	}
+	hostPort := r.URL.HostPort
+
+	serverConn, err := net.DialTimeout("tcp", hostPort, 5*time.Second) // 设置连接超时
+	if err != nil {
+		errl.Printf("Failed to connect to %s: %v", hostPort, err)
+		sendErrorPage(c, "502 Bad Gateway", "Bad Gateway", fmt.Sprintf("Failed to connect to %s", hostPort))
+		return
+	}
+	defer serverConn.Close()
+
+	// Send 200 Connection Established response to client
+	c.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+
+	// Start copying data between client and server directly without upgrading to TLS
+	go func() {
+		_, _ = io.Copy(serverConn, c.Conn)
+		serverConn.Close()
+	}()
+	_, err = io.Copy(c.Conn, serverConn)
+
+	// 检查 SSL 错误
+	if config.DetectSSLErr && time.Since(c.start) < sslLeastDuration {
+		info.Printf("SSL connection established in %v", time.Since(c.start))
+	}
 }
 
 // If an http response may have message body
