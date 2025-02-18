@@ -296,14 +296,24 @@ func (ss *SiteStat) store(statPath string) (err error) {
 	}
 	if _, err = f.Write(b); err != nil {
 		errl.Println("Error writing stat file:", err)
-		f.Close()
-		return
+		if err := f.Close(); err != nil {
+			return err
+		}
+		return err
 	}
-	f.Close()
+	if err = f.Close(); err != nil {
+		return err
+	}
 
 	// Windows don't allow rename to existing file.
-	os.Remove(statPath + ".bak")
-	os.Rename(statPath, statPath+".bak")
+	err = os.Remove(statPath + ".bak")
+	if err != nil {
+		return err
+	}
+	err = os.Rename(statPath, statPath+".bak")
+	if err != nil {
+		return err
+	}
 	if err = os.Rename(f.Name(), statPath); err != nil {
 		errl.Println("rename new stat file", err)
 		return
@@ -433,7 +443,10 @@ func initSiteStat() {
 		// After all its not critical , simply re-create a stat object if anything is not ok
 		if err != nil {
 			siteStat = newSiteStat()
-			siteStat.load("") // load default site list
+			err := siteStat.load("")
+			if err != nil {
+				return
+			} // load default site list
 		}
 	}
 
@@ -464,7 +477,10 @@ func storeSiteStat(cont byte) {
 	if siteStatFini {
 		return
 	}
-	siteStat.store(config.StatFile)
+	err := siteStat.store(config.StatFile)
+	if err != nil {
+		return
+	}
 	if cont == siteStatExit {
 		siteStatFini = true
 	}
@@ -478,20 +494,24 @@ func loadSiteList(fpath string) (lst []string, err error) {
 		if !os.IsNotExist(err) {
 			info.Printf("Error loading domaint list: %v\n", err)
 		}
-		return
+		return nil, err
 	}
 	f, err := os.Open(fpath)
 	if err != nil {
 		errl.Println("Error opening domain list:", err)
-		return
+		return nil, err
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			errl.Println("Error closing domain list:", err)
+		}
+	}()
 
 	scanner := bufio.NewScanner(f)
 	lst = make([]string, 0)
 	for scanner.Scan() {
 		site := strings.TrimSpace(scanner.Text())
-		if site == "" {
+		if site == "" || site[0] == '#' {
 			continue
 		}
 		lst = append(lst, site)

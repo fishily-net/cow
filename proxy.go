@@ -438,6 +438,12 @@ func (c *clientConn) shouldRetry(r *Request, sv *serverConn, re error) bool {
 			genErrMsg(r, sv, "Has tried several times."))
 		return false
 	}
+	// Implement exponential backoff
+	backoffDuration := time.Duration(1<<r.tryCnt) * time.Millisecond
+	if backoffDuration > 8*time.Second {
+		backoffDuration = 8 * time.Second
+	}
+	time.Sleep(backoffDuration)
 	return true
 }
 
