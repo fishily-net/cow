@@ -752,6 +752,16 @@ func (c *clientConn) getServerConn(r *Request) (*serverConn, error) {
 	siteInfo := siteStat.GetVisitCnt(r.URL)
 	// For CONNECT method, always create new connection.
 	if r.isConnect {
+		// 尝试从连接池中获取HTTPS连接
+		sv := connPool.Get(r.URL.HostPort, siteInfo.AsDirect())
+		if sv != nil {
+			// 重置连接状态为已连接
+			sv.state = svConnected
+			if debug {
+				debug.Printf("cli(%s) connPool get %s\n", c.RemoteAddr(), r.URL.HostPort)
+			}
+			return sv, nil
+		}
 		return c.createServerConn(r, siteInfo)
 	}
 	sv := connPool.Get(r.URL.HostPort, siteInfo.AsDirect())
@@ -971,6 +981,11 @@ func (sv *serverConn) Close() error {
 		debug.Printf("close connection to %s remains %d concurrent connections\n",
 			sv.hostPort, decSrvConnCnt(sv.hostPort))
 	}
+	// 增加连接关闭前的检查，确保连接未被强制关闭
+	if sv.Conn != nil {
+		// 设置一个短暂的超时，确保连接能够正常关闭
+		sv.Conn.SetDeadline(time.Now().Add(100 * time.Millisecond))
+	}
 	return sv.Conn.Close()
 }
 
@@ -1127,6 +1142,11 @@ func copyClient2Server(c *clientConn, sv *serverConn, r *Request, srvStopped *no
 				siteStat.TempBlocked(r.URL)
 			} else if isErrTimeout(err) && !srvStopped.hasNotified() {
 				continue
+			}
+			// 增加对连接关闭错误的处理
+			if strings.Contains(err.Error(), "use of closed network connection") {
+				debug.Println("Connection closed by remote host:", r)
+				return nil
 			}
 			return err
 		}

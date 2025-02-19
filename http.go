@@ -655,12 +655,31 @@ func (c *clientConn) handleConnect(r *Request) {
 	}
 	hostPort := r.URL.HostPort
 
-	serverConn, err := net.DialTimeout("tcp", hostPort, 5*time.Second) // 设置连接超时
+	// 首先尝试直接连接
+	serverConn, err := net.DialTimeout("tcp", hostPort, 3*time.Second) // 减少超时时间
 	if err != nil {
 		errl.Printf("Failed to connect to %s: %v", hostPort, err)
-		sendErrorPage(c, "502 Bad Gateway", "Bad Gateway", fmt.Sprintf("Failed to connect to %s", hostPort))
-		return
+		if isErrTimeout(err) {
+			errl.Printf("Connection to %s timed out", hostPort)
+		} else if isErrConnReset(err) {
+			errl.Printf("Connection to %s reset by peer", hostPort)
+		} else {
+			errl.Printf("Other error connecting to %s: %v", hostPort, err)
+		}
+
+		// 直接连接失败，尝试通过二级代理连接
+		proxyConn, proxyErr := parentProxy.connect(r.URL)
+		if proxyErr != nil {
+			errl.Printf("Failed to connect to %s via parent proxy: %v", hostPort, proxyErr)
+			sendErrorPage(c, "502 Bad Gateway", "Bad Gateway", fmt.Sprintf("Failed to connect to %s", hostPort))
+			return
+		}
+		serverConn = proxyConn
+
+		// 增加二级代理连接成功后的日志记录
+		info.Printf("Successfully connected to %s via parent proxy", hostPort)
 	}
+
 	defer serverConn.Close()
 
 	// Send 200 Connection Established response to client
@@ -668,10 +687,16 @@ func (c *clientConn) handleConnect(r *Request) {
 
 	// Start copying data between client and server directly without upgrading to TLS
 	go func() {
-		_, _ = io.Copy(serverConn, c.Conn)
+		_, err := io.Copy(serverConn, c.Conn)
+		if err != nil {
+			errl.Printf("Error copying data from client to server: %v", err)
+		}
 		serverConn.Close()
 	}()
 	_, err = io.Copy(c.Conn, serverConn)
+	if err != nil {
+		errl.Printf("Error copying data from server to client: %v", err)
+	}
 
 	// 检查 SSL 错误
 	if config.DetectSSLErr && time.Since(c.start) < sslLeastDuration {

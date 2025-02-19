@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	version               = "0.9.9"
+	version               = "0.9.10"
 	defaultListenAddr     = "127.0.0.1:3132"
 	defaultEstimateTarget = "baidu.cn"
 )
