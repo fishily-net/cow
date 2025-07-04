@@ -307,13 +307,7 @@ func (ss *SiteStat) store(statPath string) (err error) {
 
 	// Windows don't allow rename to existing file.
 	err = os.Remove(statPath + ".bak")
-	if err != nil {
-		return err
-	}
 	err = os.Rename(statPath, statPath+".bak")
-	if err != nil {
-		return err
-	}
 	if err = os.Rename(f.Name(), statPath); err != nil {
 		errl.Println("rename new stat file", err)
 		return
